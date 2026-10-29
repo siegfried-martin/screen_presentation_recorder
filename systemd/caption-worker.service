@@ -1,0 +1,11 @@
+[Unit]
+Description=Transcribe presentation recordings with WhisperX
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/caption-worker
+TimeoutStartSec=infinity
+# Only use CPU/disk time nothing else wants, so recording and normal work aren't slowed.
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle

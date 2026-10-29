@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# caption-video: transcribe a recording with WhisperX (CPU) and add captions.
+#
+#   caption-video [--burn] [--lang CODE] [--model NAME] FILE
+#
+# Writes next to FILE:
+#   FILE.srt / .vtt / .txt   captions and plain transcript (edit the .srt to fix words)
+#   FILE.captioned.mp4       copy of the video with a soft caption track (toggle in player)
+#   FILE.burned.mp4          only with --burn: captions drawn into the picture
+# (For audio-only files just the .srt/.vtt/.txt are written.)
+#
+# After editing FILE.srt, re-run with --remux to rebuild the .mp4 files without re-transcribing.
+set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+burn=0 remux=0 lang=en model=large-v3-turbo
+usage() { sed -n '2,13s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --burn) burn=1 ;;
+    --remux) remux=1 ;;
+    --lang) lang=$2; shift ;;
+    --model) model=$2; shift ;;
+    -h|--help) usage ;;
+    -*) echo "unknown option: $1" >&2; usage 1 ;;
+    *) break ;;
+  esac
+  shift
+done
+[[ $# -eq 1 && -f $1 ]] || usage 1
+
+in=$(realpath "$1")
+base=${in%.*}
+name=$(basename "$base")
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"; rm -f "$base".*.part' EXIT
+
+if (( ! remux )); then
+  whisperx "$in" --model "$model" --device cpu --compute_type int8 --language "$lang" \
+    --threads "$(nproc)" --output_format all --output_dir "$tmp" \
+    --max_line_width 42 --max_line_count 2 --print_progress True
+  for ext in srt vtt txt; do mv "$tmp/$name.$ext" "$base.$ext"; done
+fi
+
+if [[ -z $(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$in") ]]; then
+  echo "done: $base.srt, $base.txt (audio only, no video to caption)"
+  exit 0
+fi
+
+meta=()
+[[ $lang == en ]] && meta=(-metadata:s:s:0 language=eng)
+ffmpeg -nostdin -y -loglevel error -i "$in" -i "$base.srt" -map 0:v -map 0:a? -map 1 \
+  -c copy -c:s mov_text "${meta[@]}" -disposition:s:0 default \
+  -f mp4 "$base.captioned.mp4.part"
+mv "$base.captioned.mp4.part" "$base.captioned.mp4"
+
+if (( burn )); then
+  cp "$base.srt" "$tmp/subs.srt"
+  ffmpeg -nostdin -y -loglevel error -i "$in" \
+    -vf "subtitles=$tmp/subs.srt:force_style='FontSize=18,Outline=2,MarginV=24'" \
+    -c:v libx264 -preset veryfast -crf 20 -c:a copy -f mp4 "$base.burned.mp4.part"
+  mv "$base.burned.mp4.part" "$base.burned.mp4"
+fi
+echo "done: $base.srt, $base.captioned.mp4"
+(( burn )) && echo "      $base.burned.mp4"
+exit 0

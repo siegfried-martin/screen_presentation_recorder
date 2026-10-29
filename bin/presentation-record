@@ -1,0 +1,443 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["obsws-python>=1.7"]
+# ///
+"""Start or stop a presentation recording.
+
+Not recording: shows the options dialog (presentation-record-dialog), then
+  - audio: records mic + computer sound with ffmpeg to an .m4a
+  - video: OBS screen recording with the audio sources muted
+  - both:  OBS screen recording with mic + computer sound
+A 3-2-1 countdown notification is shown and cleared before recording starts,
+and GNOME Do Not Disturb is on while recording (USE_DND) so popups stay out
+of the video. A background "--watch" copy of this script notices when the
+recording stops, whether by clicking the dock icon again or in OBS itself, then
+closes OBS, restores notifications and, if transcription was chosen, writes
+NAME.request.json for caption-worker (see caption-worker / caption-video).
+
+The screen is chosen in the dialog: the script writes a GNOME screen-share
+restore token for that monitor, so GNOME's own picker is skipped (except for
+"Pick a window…").
+Recordings go to ~/Videos/Presentations.
+"""
+
+import fcntl
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import obsws_python as obsws
+
+logging.disable(logging.CRITICAL)  # obsws-python logs every failed connect attempt
+
+HOME = Path.home()
+OUT_DIR = HOME / "Videos/Presentations"
+WS_CONFIG = HOME / ".config/obs-studio/plugin_config/obs-websocket/config.json"
+STATE_DIR = HOME / ".local/state/presentation-record"
+SESSION = STATE_DIR / "session.json"
+LOG = STATE_DIR / "recorder.log"
+DIALOG = Path(__file__).resolve().parent / "presentation-record-dialog"
+SCENES = HOME / ".config/obs-studio/basic/scenes/Presentation.json"
+PROFILE = "Presentation"  # OBS profile + scene collection (see install.sh)
+SCREEN = "Screen"
+DEFAULT_CANVAS = (1920, 1200)
+MAX_OUTPUT = (1920, 1200)  # bigger screens are scaled down to fit
+FPS = 15
+OBS_APP_ID = "com.obsproject.Studio"
+# Turn on Do Not Disturb while recording so popups stay out of the video.
+USE_DND = True
+PORTAL_APP_IDS = [OBS_APP_ID, "presentation-record"]
+
+
+def notify(summary, body="", urgency="normal", replace=None, transient=False):
+    """Show a desktop notification and return its id."""
+    cmd = ["notify-send", "-p", "-a", "Record Presentation", "-i", "presentation-record",
+           "-u", urgency]
+    if replace:
+        cmd += ["-r", str(replace)]
+    if transient:
+        cmd += ["-e"]
+    out = subprocess.run(cmd + [summary, body], capture_output=True, text=True).stdout
+    return int(out.strip()) if out.strip().isdigit() else None
+
+
+def close_notification(nid):
+    if nid:
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                        "--object-path", "/org/freedesktop/Notifications",
+                        "--method", "org.freedesktop.Notifications.CloseNotification", str(nid)],
+                       capture_output=True, check=False)
+
+
+def countdown(nid):
+    """3-2-1, then clear the notification so it isn't in the recording."""
+    for n in (3, 2, 1):
+        nid = notify(f"Recording in {n}…", "", replace=nid, transient=True)
+        time.sleep(1)
+    close_notification(nid)
+    time.sleep(0.8)  # let the banner slide away
+
+
+def set_dnd(on):
+    """Turn GNOME Do Not Disturb on/off; returns the previous show-banners value."""
+    key = ["org.gnome.desktop.notifications", "show-banners"]
+    prev = subprocess.run(["gsettings", "get", *key], capture_output=True, text=True).stdout.strip()
+    subprocess.run(["gsettings", "set", *key, "false" if on else "true"], check=False)
+    return prev
+
+
+def restore_dnd(prev):
+    if prev in ("true", "false"):
+        subprocess.run(["gsettings", "set", "org.gnome.desktop.notifications", "show-banners",
+                        prev], check=False)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def wait_exit(pids, seconds):
+    deadline = time.monotonic() + seconds
+    while any(alive(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.25)
+
+
+def obs_pids():
+    out = subprocess.run(["pgrep", "-x", "obs"], capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+def connect(timeout):
+    cfg = json.loads(WS_CONFIG.read_text())
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return obsws.ReqClient(host="localhost", port=cfg["server_port"],
+                                   password=cfg["server_password"], timeout=5)
+        except Exception:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.5)
+
+
+def req(cl, name, data=None):
+    return cl.send(name, data, raw=True) or {}
+
+
+def quit_obs():
+    pids = obs_pids()
+    for pid in pids:
+        os.kill(pid, signal.SIGTERM)  # OBS saves its settings and exits cleanly
+    wait_exit(pids, 10)
+
+
+def gv_str(s):
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def screen_token(screen):
+    """GNOME screen-share restore token that selects this monitor without asking.
+
+    Same format GNOME's portal stores after you tick a screen in its picker:
+    an entry in the "screencast" permission table, keyed by the token.
+    """
+    token = str(uuid.uuid5(uuid.NAMESPACE_URL, "presentation-record:" + screen["match"]))
+    now = int(time.time() * 1_000_000)
+    perms = "{" + ", ".join(f"{gv_str(a)}: ['yes']" for a in PORTAL_APP_IDS) + "}"
+    data = (f"<('GNOME', uint32 1, <(int64 {now}, int64 {now}, "
+            f"[(uint32 0, uint32 1, <{gv_str(screen['match'])}>)])>)>")
+    subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.impl.portal.PermissionStore",
+         "--object-path", "/org/freedesktop/impl/portal/PermissionStore",
+         "--method", "org.freedesktop.impl.portal.PermissionStore.Set",
+         "screencast", "true", token, perms, data],
+        check=True, capture_output=True)
+    return token
+
+
+def preset_token(token):
+    """Put the restore token in the saved scene so OBS starts on the right screen."""
+    try:
+        data = json.loads(SCENES.read_text())
+    except (OSError, ValueError):
+        return
+    for src in data.get("sources", []):
+        if src.get("name") == SCREEN:
+            src.setdefault("settings", {})["RestoreToken"] = token
+    SCENES.write_text(json.dumps(data, indent=4))
+
+
+def set_canvas(cl, width, height):
+    scale = min(1.0, MAX_OUTPUT[0] / width, MAX_OUTPUT[1] / height)
+    req(cl, "SetVideoSettings", {
+        "baseWidth": width, "baseHeight": height,
+        "outputWidth": int(width * scale) // 2 * 2, "outputHeight": int(height * scale) // 2 * 2,
+        "fpsNumerator": FPS, "fpsDenominator": 1,
+    })
+
+
+def setup_screen_source(cl, token, size, fresh):
+    """Make the "Screen" source capture the chosen screen (token "" = GNOME picker)."""
+    scene = req(cl, "GetCurrentProgramScene")["currentProgramSceneName"]
+    inputs = {i["inputName"] for i in req(cl, "GetInputList")["inputs"]}
+    current = None
+    if SCREEN in inputs:
+        current = req(cl, "GetInputSettings", {"inputName": SCREEN})["inputSettings"].get(
+            "RestoreToken", "")
+    if current is None or current != token or (not token and not fresh):
+        if current is not None:
+            req(cl, "RemoveInput", {"inputName": SCREEN})
+        req(cl, "CreateInput", {
+            "sceneName": scene, "inputName": SCREEN,
+            "inputKind": "pipewire-screen-capture-source",
+            "inputSettings": {"ShowCursor": True, "RestoreToken": token},
+            "sceneItemEnabled": True,
+        })
+    set_canvas(cl, *size)
+    item = req(cl, "GetSceneItemId", {"sceneName": scene, "sourceName": SCREEN})["sceneItemId"]
+    req(cl, "SetSceneItemTransform", {
+        "sceneName": scene, "sceneItemId": item,
+        "sceneItemTransform": {
+            "positionX": 0, "positionY": 0, "alignment": 5,
+            "boundsType": "OBS_BOUNDS_SCALE_INNER", "boundsAlignment": 0,
+            "boundsWidth": size[0], "boundsHeight": size[1],
+        },
+    })
+    deadline = time.monotonic() + 120  # time to answer GNOME's picker, if it is shown
+    while time.monotonic() < deadline:
+        t = req(cl, "GetSceneItemTransform", {"sceneName": scene, "sceneItemId": item})
+        if t["sceneItemTransform"]["sourceWidth"] > 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def set_audio_muted(cl, muted):
+    special = req(cl, "GetSpecialInputs")
+    for key in ("desktop1", "mic1"):
+        if special.get(key):
+            req(cl, "SetInputMute", {"inputName": special[key], "inputMuted": muted})
+
+
+def prepare_obs(options):
+    """Launch OBS (if needed) and point it at the chosen screen. Returns a client, not recording."""
+    screen = options.get("screen") or {"picker": True}
+    if screen.get("picker"):
+        token, size = "", DEFAULT_CANVAS
+        notify("Choose what to record", "Pick a window or screen in GNOME's dialog.", transient=True)
+    else:
+        token, size = screen_token(screen), (screen["width"], screen["height"])
+    fresh = not obs_pids()
+    if fresh:
+        preset_token(token)
+        with LOG.open("ab") as log:
+            # Own scope so GNOME's portal sees a stable app ID for the restore token.
+            subprocess.Popen(
+                ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                 f"--unit=app-gnome-{OBS_APP_ID}-{os.getpid()}", "--",
+                 "obs", "--profile", PROFILE, "--collection", PROFILE, "--minimize-to-tray"],
+                stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        cl = connect(timeout=30)
+    except Exception:
+        notify("Recording not started", "OBS didn't respond. Check the OBS window.", "critical")
+        return None
+    if not setup_screen_source(cl, token, size, fresh):
+        notify("Recording not started", "No screen was shared with OBS.", "critical")
+        quit_obs()
+        return None
+    set_audio_muted(cl, options["recording"] == "video")
+    return cl
+
+
+def begin_obs(cl):
+    req(cl, "StartRecord")
+    return {}
+
+
+def begin_audio():
+    path = OUT_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S.m4a")
+    with LOG.open("ab") as log:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+             "-f", "pulse", "-i", "default", "-f", "pulse", "-i", "@DEFAULT_MONITOR@",
+             "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[a]",
+             "-map", "[a]", "-c:a", "aac", "-b:a", "160k",
+             # fragmented so the file stays playable if the laptop dies mid-recording
+             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+             "-frag_duration", "1000000", str(path)],
+            stdout=log, stderr=log, start_new_session=True)
+    time.sleep(1)
+    if proc.poll() is not None:
+        notify("Recording not started", f"ffmpeg failed; see {LOG}", "critical")
+        return None
+    return {"pid": proc.pid, "path": str(path)}
+
+
+def start():
+    res = subprocess.run([str(DIALOG)], capture_output=True, text=True)
+    if res.returncode != 0:
+        return  # cancelled
+    options = json.loads(res.stdout)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    audio = options["recording"] == "audio"
+    nid = notify("Getting ready to record…", "", transient=True)
+    cl = None if audio else prepare_obs(options)
+    if not audio and cl is None:
+        close_notification(nid)
+        return
+    countdown(nid)
+    dnd_prev = set_dnd(True) if USE_DND else None
+    session = begin_audio() if audio else begin_obs(cl)
+    if session is None:
+        restore_dnd(dnd_prev)
+        return
+    SESSION.write_text(json.dumps(options | session | {"started": time.time(),
+                                                       "dnd_prev": dnd_prev}))
+    with LOG.open("ab") as log:
+        subprocess.Popen([str(Path(__file__).resolve()), "--watch"], stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def newest_recording(since):
+    files = [f for ext in ("mp4", "mkv") for f in OUT_DIR.glob(f"*.{ext}")
+             if f.stat().st_mtime > since
+             and not f.name.endswith((".captioned.mp4", ".burned.mp4"))]
+    return str(max(files, key=lambda f: f.stat().st_mtime)) if files else ""
+
+
+def finalize(session, path=None):
+    """Recording has stopped (by any means): close OBS, restore notifications, queue transcript."""
+    claim = SESSION.with_suffix(".stopping")
+    try:
+        SESSION.rename(claim)  # whoever renames first does the work
+    except FileNotFoundError:
+        return
+    if session.get("recording") == "audio":
+        path = session["path"]
+    else:
+        path = path or newest_recording(session.get("started", 0))
+        quit_obs()
+    restore_dnd(session.get("dnd_prev"))
+    saved(path, session.get("transcription", "none"))
+    claim.unlink(missing_ok=True)
+
+
+def watch():
+    """Background helper: finalize as soon as the recording stops, even if stopped in OBS."""
+    cl, seen_active, began = None, False, time.monotonic()
+    while True:
+        time.sleep(2)
+        try:
+            session = json.loads(SESSION.read_text())
+        except (OSError, ValueError):
+            return  # finalized elsewhere
+        if session.get("recording") == "audio":
+            if not alive(session["pid"]):
+                finalize(session)
+                return
+            continue
+        if not obs_pids():
+            finalize(session)
+            return
+        try:
+            cl = cl or connect(timeout=5)
+            active = req(cl, "GetRecordStatus")["outputActive"]
+        except Exception:
+            cl = None
+            continue
+        seen_active |= active
+        if not active and (seen_active or time.monotonic() - began > 20):
+            finalize(session)
+            return
+
+
+def stop(session):
+    if session.get("recording") == "audio":
+        pid = session["pid"]
+        if alive(pid):
+            os.kill(pid, signal.SIGINT)  # ffmpeg finishes the file and exits
+            wait_exit([pid], 15)
+        finalize(session)
+        return
+    try:
+        path = req(connect(timeout=10), "StopRecord").get("outputPath", "")
+    except Exception:
+        path = ""
+    if "started" not in session:  # OBS recording started by hand: just stop it
+        notify("Recording saved", Path(path).name if path else "")
+        return
+    for _ in range(40):  # the watcher normally finalizes within a couple of seconds
+        if not SESSION.exists():
+            return
+        time.sleep(0.25)
+    finalize(session, path)
+
+
+def saved(path, transcription):
+    if path and transcription != "none":
+        request = Path(path).with_suffix(".request.json")
+        request.write_text(json.dumps({"transcription": transcription}))
+        subprocess.run(["systemctl", "--user", "start", "--no-block", "caption-worker.service"],
+                       check=False)
+        notify("Recording saved",
+               f"{Path(path).name}\nThe transcript will be generated in the background.")
+    else:
+        notify("Recording saved", Path(path).name if path else "")
+
+
+def current_session():
+    """The recording in progress, if any (including OBS recordings started by hand)."""
+    try:
+        session = json.loads(SESSION.read_text())
+    except (OSError, ValueError):
+        session = None
+    if session and session.get("recording") == "audio":
+        return session if alive(session["pid"]) else None
+    if obs_pids():
+        try:
+            if req(connect(timeout=10), "GetRecordStatus")["outputActive"]:
+                return session or {"recording": "both", "transcription": "none"}
+        except Exception:
+            pass
+    return None
+
+
+def main():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if sys.argv[1:] == ["--watch"]:
+        watch()
+        return
+    lock = (STATE_DIR / "lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        notify("Still working on the last click", "Wait for the countdown to finish.")
+        return
+    session = current_session()
+    if session:
+        stop(session)
+        return
+    try:
+        stale = json.loads(SESSION.read_text())
+    except (OSError, ValueError):
+        stale = None
+    if stale:  # stopped while nothing was watching (e.g. after a crash)
+        finalize(stale)
+    start()
+
+
+if __name__ == "__main__":
+    main()

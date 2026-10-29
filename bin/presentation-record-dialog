@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+"""Options dialog for presentation-record.
+
+Prints the chosen options as JSON on stdout and exits 0 when the user clicks
+Start; exits 1 on Cancel/close. Remembers the last choices.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, Gtk  # noqa: E402
+
+STATE = Path.home() / ".local/state/presentation-record/last-options.json"
+RECORDING = [("audio", "Audio"), ("video", "Video"), ("both", "Both")]
+TRANSCRIPTION = [("none", "None"), ("transcript", "Transcript only")]
+DEFAULTS = {"recording": "both", "transcription": "transcript", "screen": None}
+PICKER = {"picker": True, "name": "Pick a window… (GNOME asks)"}
+
+
+def monitors():
+    """Connected, enabled monitors from Mutter, primary first."""
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+    state = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                          "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                          Gio.DBusCallFlags.NONE, -1, None).unpack()
+    _serial, mons, logical, _props = state
+    primary = {spec[0] for lm in logical if lm[4] for spec in lm[5]}
+    found = []
+    for (connector, vendor, product, serial), modes, props in mons:
+        current = next((m for m in modes if m[6].get("is-current")), None)
+        if current is None:
+            continue
+        found.append({
+            "match": f"{vendor}:{product}:{serial}",
+            "name": props.get("display-name", connector),
+            "connector": connector,
+            "width": current[1], "height": current[2],
+            "primary": connector in primary,
+        })
+    return sorted(found, key=lambda m: not m["primary"])
+
+
+def load_last():
+    try:
+        return DEFAULTS | json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def toggle_group(options, active):
+    group = Adw.ToggleGroup(valign=Gtk.Align.CENTER)
+    for name, label in options:
+        group.add(Adw.Toggle(name=name, label=label))
+    group.set_active_name(active)
+    return group
+
+
+class OptionsWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Record Presentation",
+                         default_width=460, resizable=False)
+        self.result = None
+        last = load_last()
+
+        self.recording = toggle_group(RECORDING, last["recording"])
+        self.transcription = toggle_group(TRANSCRIPTION, last["transcription"])
+        self.recording.connect("notify::active-name", self.on_recording_changed)
+
+        rec_row = Adw.ActionRow(title="Recording", subtitle="Microphone and computer sound")
+        rec_row.add_suffix(self.recording)
+        self.rec_row = rec_row
+
+        try:
+            self.screens = monitors() + [PICKER]
+        except Exception:
+            self.screens = [PICKER]
+        labels = [s["name"] if s.get("picker") else f'{s["name"]} ({s["width"]}×{s["height"]})'
+                  for s in self.screens]
+        self.screen_row = Adw.ComboRow(title="Screen", model=Gtk.StringList.new(labels))
+        last_match = (last.get("screen") or {}).get("match")
+        last_picker = (last.get("screen") or {}).get("picker")
+        for i, s in enumerate(self.screens):
+            if (last_match and s.get("match") == last_match) or (last_picker and s.get("picker")):
+                self.screen_row.set_selected(i)
+
+        self.trans_row = Adw.ActionRow(title="Transcription")
+        self.trans_row.add_suffix(self.transcription)
+
+        group = Adw.PreferencesGroup()
+        group.add(rec_row)
+        group.add(self.screen_row)
+        group.add(self.trans_row)
+
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.close())
+        start = Gtk.Button(label="Start Recording")
+        start.add_css_class("suggested-action")
+        start.connect("clicked", self.on_start)
+        buttons = Gtk.Box(spacing=12, halign=Gtk.Align.END)
+        buttons.append(cancel)
+        buttons.append(start)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                       margin_top=6, margin_bottom=18, margin_start=18, margin_end=18)
+        body.append(group)
+        body.append(buttons)
+
+        view = Adw.ToolbarView(content=body)
+        view.add_top_bar(Adw.HeaderBar())
+        self.set_content(view)
+        self.set_default_widget(start)
+
+        esc = Gtk.ShortcutController()
+        esc.add_shortcut(Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string("Escape"),
+                                      action=Gtk.CallbackAction.new(lambda *_: self.close())))
+        self.add_controller(esc)
+        self.on_recording_changed()
+        start.grab_focus()
+
+    def on_recording_changed(self, *_):
+        mode = self.recording.get_active_name()
+        has_audio = mode != "video"
+        self.screen_row.set_sensitive(mode != "audio")
+        self.trans_row.set_sensitive(has_audio)
+        self.trans_row.set_subtitle("" if has_audio else "No audio to transcribe")
+        self.rec_row.set_subtitle({
+            "audio": "Microphone and computer sound",
+            "video": "Screen only, no sound",
+            "both": "Screen, microphone and computer sound",
+        }[mode])
+
+    def on_start(self, *_):
+        recording = self.recording.get_active_name()
+        transcription = self.transcription.get_active_name()
+        screen = self.screens[self.screen_row.get_selected()]
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps({"recording": recording, "transcription": transcription,
+                                     "screen": screen}))
+        self.result = {
+            "recording": recording,
+            "transcription": "none" if recording == "video" else transcription,
+            "screen": None if recording == "audio" else screen,
+        }
+        self.close()
+
+
+def main():
+    app = Adw.Application(application_id="local.presentation-record.dialog")
+    windows = []
+
+    def on_activate(app):
+        if not windows:
+            windows.append(OptionsWindow(app))
+        windows[0].present()
+
+    app.connect("activate", on_activate)
+    app.run([sys.argv[0]])
+    if windows and windows[0].result:
+        print(json.dumps(windows[0].result))
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

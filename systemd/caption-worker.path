@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch ~/Videos/Presentations for new recordings to caption
+
+[Path]
+PathChanged=%h/Videos/Presentations
+Unit=caption-worker.service
+
+[Install]
+WantedBy=default.target

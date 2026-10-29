@@ -1,0 +1,35 @@
+{
+    "name": "Presentation",
+    "DesktopAudioDevice1": {
+        "name": "Desktop Audio",
+        "id": "pulse_output_capture",
+        "versioned_id": "pulse_output_capture",
+        "settings": {"device_id": "default"},
+        "mixers": 255,
+        "enabled": true,
+        "muted": false
+    },
+    "AuxAudioDevice1": {
+        "name": "Mic/Aux",
+        "id": "pulse_input_capture",
+        "versioned_id": "pulse_input_capture",
+        "settings": {"device_id": "default"},
+        "mixers": 255,
+        "enabled": true,
+        "muted": false
+    },
+    "sources": [
+        {
+            "name": "Scene",
+            "id": "scene",
+            "versioned_id": "scene",
+            "settings": {"id_counter": 0, "custom_size": false, "items": []}
+        }
+    ],
+    "groups": [],
+    "scene_order": [{"name": "Scene"}],
+    "current_scene": "Scene",
+    "current_program_scene": "Scene",
+    "current_transition": "Fade",
+    "transition_duration": 300
+}

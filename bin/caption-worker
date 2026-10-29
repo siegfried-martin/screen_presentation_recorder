@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# caption-worker: transcribe recordings in ~/Videos/Presentations that have a NAME.request.json
+# (written by presentation-record when transcription was chosen).
+# Run by caption-worker.service (low CPU/IO priority), which caption-worker.path starts
+# whenever that folder changes. Waits for files still being recorded.
+# On success the request file is removed. On failure NAME.caption-failed.log is written and
+# the recording is skipped until that log is deleted.
+set -u
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+DIR="${CAPTION_DIR:-$HOME/Videos/Presentations}"
+shopt -s nullglob
+
+notify() { notify-send -a "Record Presentation" -i presentation-record "$@" || true; }
+
+while :; do
+  worked=0
+  for req in "$DIR"/*.request.json; do
+    base=${req%.request.json}
+    [[ -e $base.caption-failed.log ]] && continue
+    f=
+    for ext in mp4 mkv m4a; do [[ -e $base.$ext ]] && { f=$base.$ext; break; }; done
+    [[ -n $f ]] || continue
+    while fuser -s "$f" 2>/dev/null; do sleep 20; done  # still recording
+    worked=1
+    name=$(basename "$f")
+    echo "transcribing $name"
+    if caption-video "$f" >"$base.caption.log" 2>&1; then
+      rm -f "$base.caption.log" "$req"
+      notify "Transcript ready" "$name"
+    else
+      mv "$base.caption.log" "$base.caption-failed.log"
+      notify -u critical "Transcription failed" "$name — see $(basename "$base").caption-failed.log"
+    fi
+  done
+  (( worked )) || break
+done

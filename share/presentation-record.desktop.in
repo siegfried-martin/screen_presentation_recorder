@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Record Presentation
+Comment=Choose recording and transcription options, then record; click again to stop
+Exec=@BINDIR@/presentation-record
+Icon=presentation-record
+Terminal=false
+StartupNotify=false
+Categories=AudioVideo;Recorder;
+Keywords=obs;record;screencast;captions;whisper;
+Actions=open-folder;
+
+[Desktop Action open-folder]
+Name=Open Recordings Folder
+Exec=xdg-open @OUT_DIR@
