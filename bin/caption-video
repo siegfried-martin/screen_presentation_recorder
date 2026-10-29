@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # caption-video: transcribe a recording with WhisperX (CPU) and add captions.
 #
-#   caption-video [--burn] [--lang CODE] [--model NAME] FILE
+#   caption-video [--burn] [--remux] [--lang CODE] [--model NAME] FILE
 #
 # Writes next to FILE:
 #   FILE.srt / .vtt / .txt   captions and plain transcript (edit the .srt to fix words)
@@ -10,11 +10,15 @@
 # (For audio-only files just the .srt/.vtt/.txt are written.)
 #
 # After editing FILE.srt, re-run with --remux to rebuild the .mp4 files without re-transcribing.
+# Default model/language come from WHISPER_MODEL / WHISPER_LANGUAGE in
+# ~/.config/presentation-record/config.env.
 set -euo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+config=$HOME/.config/presentation-record/config.env
+[[ -r $config ]] && source "$config"
 
-burn=0 remux=0 lang=en model=large-v3-turbo
-usage() { sed -n '2,13s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+burn=0 remux=0 lang=${WHISPER_LANGUAGE:-en} model=${WHISPER_MODEL:-large-v3-turbo}
+usage() { sed -n '2,15s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
 while [[ $# -gt 0 ]]; do
   case $1 in
     --burn) burn=1 ;;

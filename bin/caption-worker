@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# caption-worker: transcribe recordings in ~/Videos/Presentations that have a NAME.request.json
+# caption-worker: transcribe recordings in the recordings folder that have a NAME.request.json
 # (written by presentation-record when transcription was chosen).
 # Run by caption-worker.service (low CPU/IO priority), which caption-worker.path starts
 # whenever that folder changes. Waits for files still being recorded.
@@ -7,7 +7,9 @@
 # the recording is skipped until that log is deleted.
 set -u
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-DIR="${CAPTION_DIR:-$HOME/Videos/Presentations}"
+config=$HOME/.config/presentation-record/config.env
+[[ -r $config ]] && source "$config"
+DIR="${CAPTION_DIR:-${RECORDINGS_DIR:-$HOME/Videos/Presentations}}"
 shopt -s nullglob
 
 notify() { notify-send -a "Record Presentation" -i presentation-record "$@" || true; }

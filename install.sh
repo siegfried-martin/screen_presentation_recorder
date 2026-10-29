@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # install.sh: install Record Presentation for the current user (no sudo needed).
 #
-#   ./install.sh [--encoder vaapi|nvenc|x264]
+#   ./install.sh [--dir FOLDER] [--encoder auto|vaapi|nvenc|x264]
 #
 # Copies the scripts to ~/.local/bin, adds the app launcher, icon and the
 # caption-worker systemd user units, and sets up an OBS profile + scene
 # collection called "Presentation" and the obs-websocket server.
+# Settings live in ~/.config/presentation-record/config.env (created from
+# config.env.example); --dir and --encoder are saved there. Re-run after
+# changing RECORDINGS_DIR or ENCODER in that file.
 # Existing OBS files are only changed after a .bak-YYYYMMDD backup.
 # Run ./uninstall.sh to remove it again.
 set -euo pipefail
@@ -15,24 +18,34 @@ BIN=$HOME/.local/bin
 APPS=$HOME/.local/share/applications
 ICONS=$HOME/.local/share/icons/hicolor/scalable/apps
 UNITS=$HOME/.config/systemd/user
-OUT_DIR=$HOME/Videos/Presentations
+CONFIG=$HOME/.config/presentation-record/config.env
 OBS=$HOME/.config/obs-studio
 PROFILE=$OBS/basic/profiles/Presentation
 SCENES=$OBS/basic/scenes/Presentation.json
 WS=$OBS/plugin_config/obs-websocket/config.json
 STAMP=$(date +%Y%m%d)
 
-encoder=
+dir= encoder=
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --encoder) encoder=$2; shift ;;
-    -h|--help) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 0 ;;
+    --dir) dir=$(realpath -m "$2"); shift ;;
+    --encoder) encoder=$2; shift
+      [[ $encoder =~ ^(auto|vaapi|nvenc|x264)$ ]] || { echo "unknown encoder: $encoder" >&2; exit 1; } ;;
+    -h|--help) sed -n '2,13s/^# \{0,1\}//p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
   shift
 done
 
 backup() { [[ -e $1 && ! -e $1.bak-$STAMP ]] && cp -a "$1" "$1.bak-$STAMP" || true; }
+
+set_config() {  # set_config KEY VALUE: replace the KEY= line in config.env, or add it
+  local tmp; tmp=$(mktemp)
+  awk -v key="$1" -v line="$1=\"$2\"" '
+    index($0, key "=") == 1 { print line; done = 1; next } { print }
+    END { if (!done) print line }' "$CONFIG" > "$tmp"
+  mv "$tmp" "$CONFIG"
+}
 
 # --- dependencies ------------------------------------------------------------
 missing=()
@@ -57,8 +70,19 @@ if pgrep -x obs >/dev/null; then
   exit 1
 fi
 
+# --- settings ----------------------------------------------------------------
+mkdir -p "$(dirname "$CONFIG")"
+[[ -e $CONFIG ]] || cp config.env.example "$CONFIG"
+[[ -n $dir ]] && set_config RECORDINGS_DIR "$dir"
+[[ -n $encoder ]] && set_config ENCODER "$encoder"
+source "$CONFIG"
+OUT_DIR=${RECORDINGS_DIR:-$HOME/Videos/Presentations}
+encoder=${ENCODER:-auto}
+echo "Settings: $CONFIG"
+echo "Recordings folder: $OUT_DIR"
+
 # --- encoder -----------------------------------------------------------------
-if [[ -z $encoder ]]; then
+if [[ $encoder == auto ]]; then
   encoder=x264
   if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
     encoder=nvenc
@@ -82,12 +106,14 @@ install -m 755 bin/presentation-record-dialog bin/caption-video bin/caption-work
 sed "1s|.*|#!/usr/bin/env -S $UV run --quiet --script|" bin/presentation-record > "$BIN/presentation-record"
 chmod 755 "$BIN/presentation-record"
 install -m 644 share/presentation-record.svg "$ICONS/"
-sed "s|@BINDIR@|$BIN|; s|@OUT_DIR@|$OUT_DIR|" share/presentation-record.desktop.in > "$APPS/presentation-record.desktop"
-install -m 644 systemd/caption-worker.service systemd/caption-worker.path "$UNITS/"
+sed "s|@BINDIR@|$BIN|g" share/presentation-record.desktop.in > "$APPS/presentation-record.desktop"
+install -m 644 systemd/caption-worker.service "$UNITS/"
+sed "s|@RECORDINGS_DIR@|$OUT_DIR|" systemd/caption-worker.path.in > "$UNITS/caption-worker.path"
 gtk-update-icon-cache -q -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database -q "$APPS" 2>/dev/null || true
 systemctl --user daemon-reload
-systemctl --user enable --now caption-worker.path
+systemctl --user enable caption-worker.path
+systemctl --user restart caption-worker.path  # pick up a changed folder
 
 # --- OBS profile, scene collection, websocket ---------------------------------
 mkdir -p "$PROFILE" "$(dirname "$SCENES")" "$(dirname "$WS")"
@@ -126,7 +152,10 @@ chmod 600 "$WS"
 
 cat <<EOF
 
-Installed. Search for "Record Presentation" in Activities, then right-click it
+Installed. Settings (fps, countdown, Whisper model, ...) are in
+  $CONFIG
+
+Search for "Record Presentation" in Activities, then right-click it
 in the dock and choose "Pin to Dash".
 
 Transcription needs WhisperX (a few GB download, CPU only):

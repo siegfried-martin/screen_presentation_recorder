@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the recordings folder for new recordings to caption
+
+[Path]
+PathChanged=@RECORDINGS_DIR@
+Unit=caption-worker.service
+
+[Install]
+WantedBy=default.target

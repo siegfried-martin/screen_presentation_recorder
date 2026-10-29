@@ -61,7 +61,8 @@ The installer is user-level only, so it never needs sudo. It does the following:
 | Transcription worker (systemd user units) | `~/.config/systemd/user/caption-worker.{path,service}` |
 | OBS profile + scene collection "Presentation" | `~/.config/obs-studio/basic/` |
 | obs-websocket enabled with a random password | `~/.config/obs-studio/plugin_config/obs-websocket/config.json` |
-| Recordings | `~/Videos/Presentations/` |
+| Settings | `~/.config/presentation-record/config.env` |
+| Recordings | `~/Videos/Presentations/` (configurable, see [Settings](#settings)) |
 
 Your other OBS profiles and scene collections are left alone. The script starts OBS
 with `--profile Presentation --collection Presentation`. Before changing an existing
@@ -77,6 +78,29 @@ overload the CPU:
 - `x264` (software) otherwise
 
 To override the choice, run `./install.sh --encoder vaapi|nvenc|x264`.
+
+## Settings
+
+All settings are in one file, `~/.config/presentation-record/config.env`. The
+installer creates it from [`config.env.example`](config.env.example) and doesn't
+overwrite it on later installs.
+
+| Setting | Default | When it applies |
+|---|---|---|
+| `RECORDINGS_DIR` | `$HOME/Videos/Presentations` | Re-run `./install.sh`, so the worker watches the new folder |
+| `ENCODER` | `auto` | Re-run `./install.sh` |
+| `FPS` | `15` | Next recording |
+| `MAX_RESOLUTION` | `1920x1200` | Next recording. Bigger screens are scaled down to fit |
+| `COUNTDOWN` | `3` | Next recording. Seconds before recording starts; `0` = no countdown |
+| `DO_NOT_DISTURB` | `true` | Next recording. Hides notification popups while recording |
+| `WHISPER_MODEL` | `large-v3-turbo` | Next transcript. `small` or `medium` are faster on slow machines |
+| `WHISPER_LANGUAGE` | `en` | Next transcript. The language spoken in the recording |
+
+You can also set the folder and encoder when installing; both are saved to the file:
+
+```sh
+./install.sh --dir ~/Documents/Talks --encoder x264
+```
 
 ## Usage
 
@@ -128,12 +152,11 @@ this project:
 caption-video [--burn] [--remux] [--lang CODE] [--model NAME] FILE
 ```
 
-- `--lang` defaults to `en`.
-- `--model` is any WhisperX/faster-whisper model; it defaults to `large-v3-turbo`.
-  Use `small` or `medium` on slower machines.
+- `--lang` and `--model` default to `WHISPER_LANGUAGE` and `WHISPER_MODEL` from the
+  settings file (`en` and `large-v3-turbo`). Any WhisperX/faster-whisper model name works.
 
 To queue a file for the background worker instead of running it in your terminal,
-create a request file next to it:
+create a request file next to it in the recordings folder:
 
 ```sh
 echo '{"transcription": "transcript"}' > ~/Videos/Presentations/NAME.request.json
@@ -158,9 +181,9 @@ caption-worker.path (watches the folder) ─▶ caption-worker.service
   token" for the chosen monitor into the xdg-desktop-portal permission store. This
   is the same entry GNOME saves when you tick a screen in its picker. OBS is started
   in a systemd scope named after its app ID, so the portal accepts the token.
-- **Frame rate and size.** These are set over websocket for each recording: 15 fps,
-  the monitor's own resolution, scaled down to fit 1920×1200. Change them with the
-  constants at the top of `bin/presentation-record` (`FPS`, `MAX_OUTPUT`, `USE_DND`).
+- **Frame rate, size and folder.** These are set over websocket at the start of
+  each recording, from the settings file. The canvas is the monitor's own resolution,
+  scaled down to fit `MAX_RESOLUTION`.
 - **Logs.**
   - Recording: `~/.local/state/presentation-record/recorder.log`
   - Transcription: `journalctl --user -u caption-worker`
@@ -174,7 +197,7 @@ caption-worker.path (watches the folder) ─▶ caption-worker.service
 ```
 
 This removes the scripts, launcher, icon and systemd units. It keeps your
-recordings and the OBS "Presentation" profile. To remove WhisperX as well, run
+recordings, your settings file and the OBS "Presentation" profile. To remove WhisperX as well, run
 `uv tool uninstall whisperx`.
 
 ## Limitations

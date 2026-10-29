@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # uninstall.sh: remove Record Presentation for the current user.
-# Keeps your recordings (~/Videos/Presentations) and the OBS "Presentation"
+# Keeps your recordings, settings (~/.config/presentation-record) and the OBS "Presentation"
 # profile/scene collection; delete those by hand if you want them gone.
 set -uo pipefail
 
@@ -12,5 +12,5 @@ rm -f ~/.local/bin/{presentation-record,presentation-record-dialog,caption-video
   ~/.config/systemd/user/caption-worker.{service,path}
 rm -rf ~/.local/state/presentation-record
 systemctl --user daemon-reload
-echo "Removed. Recordings and the OBS Presentation profile were kept."
+echo "Removed. Recordings, settings and the OBS Presentation profile were kept."
 echo "WhisperX can be removed with: uv tool uninstall whisperx"

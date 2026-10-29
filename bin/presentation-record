@@ -10,8 +10,7 @@ Not recording: shows the options dialog (presentation-record-dialog), then
   - video: OBS screen recording with the audio sources muted
   - both:  OBS screen recording with mic + computer sound
 A 3-2-1 countdown notification is shown and cleared before recording starts,
-and GNOME Do Not Disturb is on while recording (USE_DND) so popups stay out
-of the video. A background "--watch" copy of this script notices when the
+and GNOME Do Not Disturb is on while recording so popups stay out of the video. A background "--watch" copy of this script notices when the
 recording stops, whether by clicking the dock icon again or in OBS itself, then
 closes OBS, restores notifications and, if transcription was chosen, writes
 NAME.request.json for caption-worker (see caption-worker / caption-video).
@@ -19,7 +18,8 @@ NAME.request.json for caption-worker (see caption-worker / caption-video).
 The screen is chosen in the dialog: the script writes a GNOME screen-share
 restore token for that monitor, so GNOME's own picker is skipped (except for
 "Pick a window…").
-Recordings go to ~/Videos/Presentations.
+Settings (recordings folder, fps, countdown, ...) are read from
+~/.config/presentation-record/config.env; see config.env.example.
 """
 
 import fcntl
@@ -39,7 +39,26 @@ import obsws_python as obsws
 logging.disable(logging.CRITICAL)  # obsws-python logs every failed connect attempt
 
 HOME = Path.home()
-OUT_DIR = HOME / "Videos/Presentations"
+CONFIG = HOME / ".config/presentation-record/config.env"
+
+
+def load_config():
+    """KEY=value lines from config.env (the same file install.sh and caption-worker read)."""
+    cfg = {}
+    try:
+        lines = CONFIG.read_text().splitlines()
+    except OSError:
+        return cfg
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            cfg[key.strip()] = os.path.expanduser(os.path.expandvars(value.strip().strip("'\"")))
+    return cfg
+
+
+CFG = load_config()
+OUT_DIR = Path(CFG.get("RECORDINGS_DIR") or HOME / "Videos/Presentations")
 WS_CONFIG = HOME / ".config/obs-studio/plugin_config/obs-websocket/config.json"
 STATE_DIR = HOME / ".local/state/presentation-record"
 SESSION = STATE_DIR / "session.json"
@@ -48,12 +67,13 @@ DIALOG = Path(__file__).resolve().parent / "presentation-record-dialog"
 SCENES = HOME / ".config/obs-studio/basic/scenes/Presentation.json"
 PROFILE = "Presentation"  # OBS profile + scene collection (see install.sh)
 SCREEN = "Screen"
-DEFAULT_CANVAS = (1920, 1200)
-MAX_OUTPUT = (1920, 1200)  # bigger screens are scaled down to fit
-FPS = 15
+MAX_OUTPUT = tuple(int(n) for n in CFG.get("MAX_RESOLUTION", "1920x1200").lower().split("x"))
+DEFAULT_CANVAS = MAX_OUTPUT  # used for "Pick a window…", whose size isn't known up front
+FPS = int(CFG.get("FPS", 15))
+COUNTDOWN = int(CFG.get("COUNTDOWN", 3))
 OBS_APP_ID = "com.obsproject.Studio"
 # Turn on Do Not Disturb while recording so popups stay out of the video.
-USE_DND = True
+USE_DND = CFG.get("DO_NOT_DISTURB", "true").lower() in ("1", "true", "yes", "on")
 PORTAL_APP_IDS = [OBS_APP_ID, "presentation-record"]
 
 
@@ -79,7 +99,7 @@ def close_notification(nid):
 
 def countdown(nid):
     """3-2-1, then clear the notification so it isn't in the recording."""
-    for n in (3, 2, 1):
+    for n in range(COUNTDOWN, 0, -1):
         nid = notify(f"Recording in {n}…", "", replace=nid, transient=True)
         time.sleep(1)
     close_notification(nid)
@@ -254,6 +274,7 @@ def prepare_obs(options):
     except Exception:
         notify("Recording not started", "OBS didn't respond. Check the OBS window.", "critical")
         return None
+    req(cl, "SetRecordDirectory", {"recordDirectory": str(OUT_DIR)})
     if not setup_screen_source(cl, token, size, fresh):
         notify("Recording not started", "No screen was shared with OBS.", "critical")
         quit_obs()
@@ -419,6 +440,10 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if sys.argv[1:] == ["--watch"]:
         watch()
+        return
+    if sys.argv[1:] == ["--open-folder"]:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["xdg-open", str(OUT_DIR)], check=False)
         return
     lock = (STATE_DIR / "lock").open("w")
     try:
